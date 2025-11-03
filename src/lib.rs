@@ -12,6 +12,82 @@ use unic_langid::LanguageIdentifier;
 
 use pyo3::create_exception;
 
+/// Helper function to convert byte position to line and column numbers
+fn byte_pos_to_line_col(source: &str, byte_pos: usize) -> (usize, usize) {
+    let relevant = &source[..byte_pos.min(source.len())];
+    let line = relevant.chars().filter(|&c| c == '\n').count() + 1;
+    let col = relevant.len() - relevant.rfind('\n').map_or(0, |pos| pos + 1) + 1;
+    (line, col)
+}
+
+/// Represents a single parsing error with detailed location information
+#[pyclass]
+#[derive(Clone)]
+struct ParseErrorDetail {
+    /// Human-readable error message
+    #[pyo3(get)]
+    message: String,
+
+    /// Line number where the error occurred (1-indexed)
+    #[pyo3(get)]
+    line: usize,
+
+    /// Column number where the error occurred (1-indexed)
+    #[pyo3(get)]
+    column: usize,
+
+    /// Byte position where the error starts (0-indexed)
+    #[pyo3(get)]
+    byte_start: usize,
+
+    /// Byte position where the error ends (0-indexed)
+    #[pyo3(get)]
+    byte_end: usize,
+
+    /// Optional file path where the error occurred
+    #[pyo3(get)]
+    filename: Option<String>,
+}
+
+#[pymethods]
+impl ParseErrorDetail {
+    fn __repr__(&self) -> String {
+        format!(
+            "ParseErrorDetail(message={:?}, line={}, column={}, byte_start={}, byte_end={})",
+            self.message, self.line, self.column, self.byte_start, self.byte_end
+        )
+    }
+
+    fn __str__(&self) -> String {
+        if let Some(ref filename) = self.filename {
+            format!(
+                "{}:{}:{}: {}",
+                filename, self.line, self.column, self.message
+            )
+        } else {
+            format!("{}:{}: {}", self.line, self.column, self.message)
+        }
+    }
+}
+
+impl ParseErrorDetail {
+    fn from_parser_error(
+        error: fluent_syntax::parser::ParserError,
+        source: &str,
+        filename: Option<String>,
+    ) -> Self {
+        let (line, column) = byte_pos_to_line_col(source, error.pos.start);
+        Self {
+            message: error.kind.to_string(),
+            line,
+            column,
+            byte_start: error.pos.start,
+            byte_end: error.pos.end,
+            filename,
+        }
+    }
+}
+
 create_exception!(rustfluent, ParserError, pyo3::exceptions::PyException);
 
 #[pymodule]
@@ -20,6 +96,9 @@ mod rustfluent {
 
     #[pymodule_export]
     use super::ParserError;
+
+    #[pymodule_export]
+    use super::ParseErrorDetail;
 
     #[pyclass]
     struct Bundle {
@@ -48,17 +127,45 @@ mod rustfluent {
                 let resource = match FluentResource::try_new(contents) {
                     Ok(resource) => resource,
                     Err((resource, errors)) if strict => {
+                        let source = resource.source();
+                        let filename_str = file_path.to_string_lossy().to_string();
+
+                        // Create structured error details for programmatic access
+                        let error_details: Vec<ParseErrorDetail> = errors
+                            .iter()
+                            .map(|e| {
+                                ParseErrorDetail::from_parser_error(
+                                    e.clone(),
+                                    source,
+                                    Some(filename_str.clone()),
+                                )
+                            })
+                            .collect();
+
+                        // Create a nice formatted error message using miette
                         let mut labels = Vec::with_capacity(errors.len());
                         for error in errors {
                             labels.push(LabeledSpan::at(error.pos, format!("{}", error.kind)))
                         }
-                        let error = miette!(
+                        let miette_error = miette!(
                             labels = labels,
                             "Error when parsing {}",
                             file_path.to_string_lossy()
                         )
-                        .with_source_code(resource.source().to_string());
-                        return Err(ParserError::new_err(format!("{error:?}")));
+                        .with_source_code(source.to_string());
+
+                        // Create the exception with the formatted message and attach error details
+                        return Err(Python::with_gil(|py| {
+                            let err = ParserError::new_err(format!("{miette_error:?}"));
+                            // Attach structured error details to the exception for programmatic access
+                            if let Ok(exc) = err
+                                .value(py)
+                                .downcast::<pyo3::exceptions::PyBaseException>()
+                            {
+                                let _ = exc.setattr("errors", error_details);
+                            }
+                            err
+                        }));
                     }
                     Err((resource, _errors)) => resource,
                 };

@@ -209,6 +209,49 @@ def test_parser_error_str():
     assert str(fluent.ParserError) == "<class 'rustfluent.ParserError'>"
 
 
+def test_parser_error_has_structured_error_details():
+    """Test that ParserError exposes structured error information."""
+    filename = data_dir / "errors.ftl"
+
+    with pytest.raises(fluent.ParserError) as exc_info:
+        fluent.Bundle("fr", [filename], strict=True)
+
+    error = exc_info.value
+
+    # Verify the errors attribute exists
+    assert hasattr(error, "errors"), "ParserError should have 'errors' attribute"
+    assert len(error.errors) == 1, "Should have exactly one error"
+
+    # Verify the structure of the error detail
+    error_detail = error.errors[0]
+    assert type(error_detail).__name__ == "ParseErrorDetail"
+
+    # Verify all expected attributes exist and have correct values
+    assert hasattr(error_detail, "message")
+    assert hasattr(error_detail, "line")
+    assert hasattr(error_detail, "column")
+    assert hasattr(error_detail, "byte_start")
+    assert hasattr(error_detail, "byte_end")
+    assert hasattr(error_detail, "filename")
+
+    # Verify the error is at the expected location
+    assert error_detail.line == 1
+    assert error_detail.column == 16
+    assert error_detail.byte_start == 15
+    assert error_detail.byte_end == 16
+
+    # Verify the message contains expected content
+    assert 'Expected a token starting with "="' in error_detail.message
+
+    # Verify filename is included
+    assert str(filename) in error_detail.filename
+
+    # Verify string representation works
+    error_str = str(error_detail)
+    assert "1:16" in error_str  # Line:column should be in string representation
+    assert "Expected a token" in error_str
+
+
 # Attribute access tests
 
 
