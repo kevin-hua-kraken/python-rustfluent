@@ -127,16 +127,64 @@ struct FormatError {
     error_type: String,
     #[pyo3(get)]
     message: String,
+
+    // Enhanced context fields
+    #[pyo3(get)]
+    message_id: Option<String>,      // Which message had the error
+
+    #[pyo3(get)]
+    variable_name: Option<String>,   // Which variable (if applicable)
+
+    #[pyo3(get)]
+    expected_type: Option<String>,   // What type was expected
+
+    #[pyo3(get)]
+    actual_type: Option<String>,     // What type was provided
 }
 
 #[pymethods]
 impl FormatError {
     fn __repr__(&self) -> String {
-        format!("FormatError(type={:?}, message={:?})", self.error_type, self.message)
+        let mut parts = vec![
+            format!("error_type={:?}", self.error_type),
+            format!("message={:?}", self.message),
+        ];
+
+        if let Some(ref msg_id) = self.message_id {
+            parts.push(format!("message_id={:?}", msg_id));
+        }
+        if let Some(ref var) = self.variable_name {
+            parts.push(format!("variable_name={:?}", var));
+        }
+        if let Some(ref expected) = self.expected_type {
+            parts.push(format!("expected_type={:?}", expected));
+        }
+        if let Some(ref actual) = self.actual_type {
+            parts.push(format!("actual_type={:?}", actual));
+        }
+
+        format!("FormatError({})", parts.join(", "))
     }
 
     fn __str__(&self) -> String {
-        format!("{}: {}", self.error_type, self.message)
+        let mut result = format!("{}: {}", self.error_type, self.message);
+
+        if let Some(ref msg_id) = self.message_id {
+            result = format!("{} in '{}'", result, msg_id);
+        }
+        if let Some(ref var) = self.variable_name {
+            result = format!("{} (variable: {})", result, var);
+        }
+        if self.expected_type.is_some() && self.actual_type.is_some() {
+            result = format!(
+                "{} (expected {}, got {})",
+                result,
+                self.expected_type.as_ref().unwrap(),
+                self.actual_type.as_ref().unwrap()
+            );
+        }
+
+        result
     }
 }
 
@@ -151,11 +199,154 @@ impl FormatError {
         Self {
             error_type: error_type.to_string(),
             message: error.to_string(),
+            message_id: None,
+            variable_name: None,
+            expected_type: None,
+            actual_type: None,
         }
     }
 }
 
 create_exception!(rustfluent, ParserError, pyo3::exceptions::PyException);
+
+/// Helper function to create a comprehensive error with all parse and validation errors
+fn create_comprehensive_error(
+    parse_errors: &[ParseErrorDetail],
+    validation_errors: &[ValidationError],
+) -> PyErr {
+    Python::with_gil(|py| {
+        if !parse_errors.is_empty() {
+            // If there are parse errors, use ParserError as primary
+            // But attach validation errors too!
+
+            let first_file = parse_errors[0].filename.as_ref()
+                .map(|s| s.as_str())
+                .unwrap_or("<string>");
+
+            // Try to read source for miette display
+            let source = std::fs::read_to_string(first_file)
+                .ok();
+
+            // Create miette error with labels
+            let mut labels = Vec::with_capacity(parse_errors.len());
+            for error in parse_errors {
+                labels.push(LabeledSpan::at(
+                    error.byte_start..error.byte_end,
+                    error.message.clone(),
+                ));
+            }
+
+            let miette_error = if let Some(source) = source {
+                miette!(
+                    labels = labels,
+                    "Found {} parse error(s) and {} validation error(s)",
+                    parse_errors.len(),
+                    validation_errors.len(),
+                )
+                .with_source_code(source)
+            } else {
+                miette!(
+                    "Found {} parse error(s) and {} validation error(s) in {}",
+                    parse_errors.len(),
+                    validation_errors.len(),
+                    first_file,
+                )
+            };
+
+            let err = ParserError::new_err(format!("{miette_error:?}"));
+
+            // Attach structured errors for programmatic access
+            if let Ok(exc) = err.value(py).downcast::<pyo3::exceptions::PyBaseException>() {
+                let _ = exc.setattr("parse_errors", parse_errors.to_vec());
+                let _ = exc.setattr("validation_errors", validation_errors.to_vec());
+                let _ = exc.setattr("error_count", parse_errors.len() + validation_errors.len());
+            }
+
+            err
+        } else {
+            // Only validation errors
+            let message = format!(
+                "Found {} validation error(s):\n{}",
+                validation_errors.len(),
+                validation_errors.iter()
+                    .map(|e| format!("  - {}", e.message))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+
+            let err = PyValueError::new_err(message);
+
+            if let Ok(exc) = err.value(py).downcast::<pyo3::exceptions::PyBaseException>() {
+                let _ = exc.setattr("validation_errors", validation_errors.to_vec());
+                let _ = exc.setattr("error_count", validation_errors.len());
+            }
+
+            err
+        }
+    })
+}
+
+/// Extract all variable references from a pattern
+fn extract_variable_references(pattern: &fluent_syntax::ast::Pattern<&str>) -> HashSet<String> {
+    let mut vars = HashSet::new();
+    collect_vars_from_pattern(pattern, &mut vars);
+    vars
+}
+
+fn collect_vars_from_pattern(pattern: &fluent_syntax::ast::Pattern<&str>, vars: &mut HashSet<String>) {
+    use fluent_syntax::ast;
+    for element in &pattern.elements {
+        if let ast::PatternElement::Placeable { expression } = element {
+            collect_vars_from_expression(expression, vars);
+        }
+    }
+}
+
+fn collect_vars_from_expression(expr: &fluent_syntax::ast::Expression<&str>, vars: &mut HashSet<String>) {
+    use fluent_syntax::ast;
+    match expr {
+        ast::Expression::Inline(inline) => match inline {
+            ast::InlineExpression::VariableReference { id } => {
+                vars.insert(id.name.to_string());
+            }
+            ast::InlineExpression::FunctionReference { arguments, .. } => {
+                // Check positional args
+                for arg in &arguments.positional {
+                    collect_vars_from_expression(&ast::Expression::Inline(arg.clone()), vars);
+                }
+                // Check named args
+                for arg in &arguments.named {
+                    collect_vars_from_expression(&ast::Expression::Inline(arg.value.clone()), vars);
+                }
+            }
+            ast::InlineExpression::TermReference { arguments, .. } => {
+                if let Some(args) = arguments {
+                    // Check positional args
+                    for arg in &args.positional {
+                        collect_vars_from_expression(&ast::Expression::Inline(arg.clone()), vars);
+                    }
+                    // Check named args
+                    for arg in &args.named {
+                        collect_vars_from_expression(&ast::Expression::Inline(arg.value.clone()), vars);
+                    }
+                }
+            }
+            _ => {}
+        },
+        ast::Expression::Select { selector, variants } => {
+            // Check selector expression
+            collect_vars_from_expression(
+                &ast::Expression::Inline((*selector).clone()),
+                vars,
+            );
+
+            // Check all variant values
+            for variant in variants {
+                collect_vars_from_pattern(&variant.value, vars);
+            }
+        }
+    }
+}
 
 /// Helper function to check all references in a resource against the bundle
 fn check_references(
@@ -414,7 +605,9 @@ mod rustfluent {
     #[pyclass]
     struct Bundle {
         bundle: FluentBundle<FluentResource>,
-        compile_errors: Vec<ValidationError>,
+        // Separated compile-time errors by type for clarity
+        parse_errors: Vec<ParseErrorDetail>,      // Syntax errors from FTL parsing
+        validation_errors: Vec<ValidationError>,   // Semantic errors (refs, cycles, etc.)
     }
 
     #[pymethods]
@@ -431,7 +624,9 @@ mod rustfluent {
                 }
             };
             let mut bundle = FluentBundle::new_concurrent(vec![langid]);
-            let mut all_errors = Vec::new();
+            // Separate error collections by type
+            let mut all_parse_errors = Vec::new();
+            let mut all_validation_errors = Vec::new();
 
             for file_path in ftl_filenames.iter() {
                 let contents = fs::read_to_string(file_path)
@@ -439,48 +634,24 @@ mod rustfluent {
 
                 let resource = match FluentResource::try_new(contents) {
                     Ok(resource) => resource,
-                    Err((resource, errors)) if strict => {
+                    Err((resource, errors)) => {
+                        // CHANGED: Always collect parse errors (even in strict mode)
+                        // Don't raise immediately - collect all errors first
                         let source = resource.source();
                         let filename_str = file_path.to_string_lossy().to_string();
 
                         // Create structured error details for programmatic access
-                        let error_details: Vec<ParseErrorDetail> = errors
-                            .iter()
-                            .map(|e| {
-                                ParseErrorDetail::from_parser_error(
-                                    e.clone(),
-                                    source,
-                                    Some(filename_str.clone()),
-                                )
-                            })
-                            .collect();
-
-                        // Create a nice formatted error message using miette
-                        let mut labels = Vec::with_capacity(errors.len());
                         for error in errors {
-                            labels.push(LabeledSpan::at(error.pos, format!("{}", error.kind)))
+                            all_parse_errors.push(ParseErrorDetail::from_parser_error(
+                                error.clone(),
+                                source,
+                                Some(filename_str.clone()),
+                            ));
                         }
-                        let miette_error = miette!(
-                            labels = labels,
-                            "Error when parsing {}",
-                            file_path.to_string_lossy()
-                        )
-                        .with_source_code(source.to_string());
 
-                        // Create the exception with the formatted message and attach error details
-                        return Err(Python::with_gil(|py| {
-                            let err = ParserError::new_err(format!("{miette_error:?}"));
-                            // Attach structured error details to the exception for programmatic access
-                            if let Ok(exc) = err
-                                .value(py)
-                                .downcast::<pyo3::exceptions::PyBaseException>()
-                            {
-                                let _ = exc.setattr("errors", error_details);
-                            }
-                            err
-                        }));
+                        // Continue processing to collect more errors
+                        resource
                     }
-                    Err((resource, _errors)) => resource,
                 };
 
                 // Check for duplicates manually before adding
@@ -514,12 +685,8 @@ mod rustfluent {
                             reference: None,
                         };
 
-                        if strict {
-                            // In strict mode, raise error immediately
-                            return Err(PyValueError::new_err(validation_err.message.clone()));
-                        }
-
-                        all_errors.push(validation_err);
+                        // CHANGED: Don't raise immediately, collect errors
+                        all_validation_errors.push(validation_err);
                     }
                 }
 
@@ -527,40 +694,109 @@ mod rustfluent {
                 if validate_references {
                     // Check if references in this resource exist in current bundle
                     let ref_errors = check_references(&resource, &bundle);
-                    if strict && !ref_errors.is_empty() {
-                        return Err(PyValueError::new_err(format!(
-                            "Found {} reference error(s) in {}",
-                            ref_errors.len(),
-                            file_path.display()
-                        )));
-                    }
-                    all_errors.extend(ref_errors);
+                    // CHANGED: Don't raise immediately, collect all errors
+                    all_validation_errors.extend(ref_errors);
 
                     // Check for cycles within this resource
                     let cycle_errors = detect_cycles(&resource);
-                    if strict && !cycle_errors.is_empty() {
-                        return Err(PyValueError::new_err(format!(
-                            "Found {} cyclic reference(s) in {}",
-                            cycle_errors.len(),
-                            file_path.display()
-                        )));
-                    }
-                    all_errors.extend(cycle_errors);
+                    // CHANGED: Don't raise immediately, collect all errors
+                    all_validation_errors.extend(cycle_errors);
                 }
 
                 // Add the resource (will override duplicates)
                 bundle.add_resource_overriding(resource);
             }
 
+            // CHANGED: Check strict mode AFTER collecting all errors
+            if strict && (!all_parse_errors.is_empty() || !all_validation_errors.is_empty()) {
+                return Err(create_comprehensive_error(
+                    &all_parse_errors,
+                    &all_validation_errors,
+                ));
+            }
+
             Ok(Self {
                 bundle,
-                compile_errors: all_errors,
+                parse_errors: all_parse_errors,
+                validation_errors: all_validation_errors,
             })
         }
 
-        /// Get all compile-time errors found during bundle creation
+        /// Get all parse errors (syntax errors from FTL parsing)
+        fn get_parse_errors(&self) -> Vec<ParseErrorDetail> {
+            self.parse_errors.clone()
+        }
+
+        /// Get all validation errors (semantic errors: unknown refs, cycles, etc.)
+        fn get_validation_errors(&self) -> Vec<ValidationError> {
+            self.validation_errors.clone()
+        }
+
+        /// Get ALL compile-time errors in one call (parse + validation)
+        /// Returns list of tuples: (error_category: str, error: Union[ParseErrorDetail, ValidationError])
+        fn get_all_compile_errors(&self, py: Python) -> PyResult<Vec<(String, PyObject)>> {
+            let mut all_errors = Vec::new();
+
+            // Add parse errors with "parse" tag
+            for err in &self.parse_errors {
+                let py_err = Py::new(py, err.clone())?;
+                all_errors.push((
+                    "parse".to_string(),
+                    py_err.into(),
+                ));
+            }
+
+            // Add validation errors with "validation" tag
+            for err in &self.validation_errors {
+                let py_err = Py::new(py, err.clone())?;
+                all_errors.push((
+                    "validation".to_string(),
+                    py_err.into(),
+                ));
+            }
+
+            Ok(all_errors)
+        }
+
+        /// DEPRECATED: Use get_validation_errors() instead
+        /// Kept for backward compatibility
         fn get_compile_errors(&self) -> Vec<ValidationError> {
-            self.compile_errors.clone()
+            self.validation_errors.clone()
+        }
+
+        /// Get list of variable names used by a specific message
+        ///
+        /// # Arguments
+        /// * `identifier` - Message ID (e.g., "hello" or "hello.attribute")
+        ///
+        /// # Returns
+        /// Sorted list of variable names (e.g., ["count", "user"])
+        fn get_required_variables(&self, identifier: &str) -> PyResult<Vec<String>> {
+            let get_message = |id: &str| {
+                self.bundle
+                    .get_message(id)
+                    .ok_or_else(|| PyValueError::new_err(format!("{id} not found")))
+            };
+
+            let pattern = match identifier.split_once('.') {
+                Some((message_id, attribute_id)) => get_message(message_id)?
+                    .get_attribute(attribute_id)
+                    .ok_or_else(|| PyValueError::new_err(format!(
+                        "Attribute '{attribute_id}' not found on message '{message_id}'"
+                    )))?
+                    .value(),
+                None => get_message(identifier)?
+                    .value()
+                    .ok_or_else(|| PyValueError::new_err(format!(
+                        "{identifier} - Message has no value."
+                    )))?
+            };
+
+            let vars = extract_variable_references(pattern);
+            let mut vars_vec: Vec<String> = vars.into_iter().collect();
+            vars_vec.sort();  // Sort for deterministic output
+
+            Ok(vars_vec)
         }
 
         #[pyo3(signature = (identifier, variables=None, use_isolating=true, errors=None))]
@@ -597,8 +833,12 @@ mod rustfluent {
                     })?
             };
 
+            // Extract all variables used by this pattern
+            let required_vars = extract_variable_references(pattern);
+
             let mut args = FluentArgs::new();
             let mut variable_errors = Vec::new();
+            let mut provided_vars = HashSet::new();
 
             if let Some(variables) = variables {
                 for (python_key, python_value) in variables {
@@ -610,6 +850,7 @@ mod rustfluent {
                         )));
                     }
                     let key = python_key.to_string();
+                    provided_vars.insert(key.clone());
                     // Set the variable value as a string or integer,
                     // raising a TypeError if not.
                     if python_value.is_instance_of::<PyString>() {
@@ -631,10 +872,28 @@ mod rustfluent {
                                 "Variable '{}' has unsupported type, expected str/int/date. Using key as fallback.",
                                 key
                             ),
+                            message_id: Some(identifier.to_string()),
+                            variable_name: Some(key.clone()),
+                            expected_type: Some("str|int|date".to_string()),
+                            actual_type: Some(format!("{:?}", python_value.get_type().name())),
                         });
                         let fallback_value = key.clone();
                         args.set(key, fallback_value);
                     }
+                }
+            }
+
+            // Check for missing variables
+            for required_var in &required_vars {
+                if !provided_vars.contains(required_var) {
+                    variable_errors.push(FormatError {
+                        error_type: "MissingVariable".to_string(),
+                        message: format!("Unknown external: {}", required_var),
+                        message_id: Some(identifier.to_string()),
+                        variable_name: Some(required_var.clone()),
+                        expected_type: None,
+                        actual_type: None,
+                    });
                 }
             }
 
