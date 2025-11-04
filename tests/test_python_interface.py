@@ -192,16 +192,8 @@ def test_raises_parser_error_on_file_that_contains_errors_in_strict_mode():
     message = "\n".join(lines)
     # End recombination
 
-    expected = f"""\
-  × Error when parsing {filename}
-   ╭─[1:16]
- 1 │ invalid-message
-   ·                ┬
-   ·                ╰── Expected a token starting with "="
- 2 │ 
- 3 │ valid-message = I'm valid.
-   ╰────
-"""
+    # Note: Line 2 has a trailing space after the pipe
+    expected = "  × Found 1 parse error(s) and 0 validation error(s)\n   ╭─[1:16]\n 1 │ invalid-message\n   ·                ┬\n   ·                ╰── Expected a token starting with \"=\"\n 2 │ \n 3 │ valid-message = I'm valid.\n   ╰────\n"
     assert message == expected
 
 
@@ -218,12 +210,12 @@ def test_parser_error_has_structured_error_details():
 
     error = exc_info.value
 
-    # Verify the errors attribute exists
-    assert hasattr(error, "errors"), "ParserError should have 'errors' attribute"
-    assert len(error.errors) == 1, "Should have exactly one error"
+    # Verify the parse_errors attribute exists
+    assert hasattr(error, "parse_errors"), "ParserError should have 'parse_errors' attribute"
+    assert len(error.parse_errors) == 1, "Should have exactly one error"
 
     # Verify the structure of the error detail
-    error_detail = error.errors[0]
+    error_detail = error.parse_errors[0]
     assert type(error_detail).__name__ == "ParseErrorDetail"
 
     # Verify all expected attributes exist and have correct values
@@ -331,3 +323,114 @@ def test_missing_attribute_raises_error():
 def test_attribute_and_message_access_parameterized(identifier, expected):
     bundle = fluent.Bundle("en", [data_dir / "attributes.ftl"])
     assert bundle.get_translation(identifier) == expected
+
+
+# ==============================================================================
+# Term Tests
+# ==============================================================================
+# Tests for Fluent terms - reusable vocabulary items that start with "-"
+# and can only be referenced within messages (not retrieved directly)
+
+
+def test_basic_term_reference():
+    """Test that messages can reference terms using { -term-name } syntax."""
+    bundle = fluent.Bundle("en", [data_dir / "terms.ftl"])
+    result = bundle.get_translation("welcome")
+    assert result == "Welcome to Acme Corporation!"
+
+
+def test_term_attribute_as_selector():
+    """Test that term attributes can be used as selectors in select expressions.
+
+    Note: Per Fluent spec, term attributes are private and can only be used
+    as selectors, not as direct placeables like { -term.attribute }.
+    """
+    bundle = fluent.Bundle("en", [data_dir / "terms.ftl"])
+    result = bundle.get_translation("product-category")
+    assert result == "This is a gadget"
+
+
+def test_multiple_term_references():
+    """Test that multiple messages can reference the same term."""
+    bundle = fluent.Bundle("en", [data_dir / "terms.ftl"])
+    assert bundle.get_translation("welcome") == "Welcome to Acme Corporation!"
+    assert bundle.get_translation("product-info") == "Learn about Super Widget"
+
+
+def test_direct_term_access_fails():
+    """Test that terms cannot be retrieved directly per Fluent spec."""
+    bundle = fluent.Bundle("en", [data_dir / "terms.ftl"])
+    with pytest.raises(ValueError, match="-brand-name not found"):
+        bundle.get_translation("-brand-name")
+
+
+def test_unknown_term_validation_error():
+    """Test that referencing a non-existent term generates a validation error."""
+    bundle = fluent.Bundle("en", [data_dir / "broken_terms.ftl"])
+
+    # Should have validation errors
+    validation_errors = bundle.get_validation_errors()
+    assert len(validation_errors) == 2  # One for unknown term, one for unknown attribute
+
+    # Find the unknown term error
+    unknown_term_errors = [e for e in validation_errors if e.error_type == "UnknownTerm"]
+    assert len(unknown_term_errors) == 1
+
+    error = unknown_term_errors[0]
+    assert error.error_type == "UnknownTerm"
+    assert "-nonexistent-term" in error.message or "nonexistent-term" in error.message
+    assert error.message_id == "broken-reference"
+
+
+def test_unknown_term_attribute_validation_error():
+    """Test that referencing a non-existent term attribute generates a validation error."""
+    bundle = fluent.Bundle("en", [data_dir / "broken_terms.ftl"])
+
+    # Should have validation errors
+    validation_errors = bundle.get_validation_errors()
+    assert len(validation_errors) == 2  # One for unknown term, one for unknown attribute
+
+    # Find the unknown attribute error
+    unknown_attr_errors = [e for e in validation_errors if e.error_type == "UnknownAttribute"]
+    assert len(unknown_attr_errors) == 1
+
+    error = unknown_attr_errors[0]
+    assert error.error_type == "UnknownAttribute"
+    assert "nonexistent" in error.message
+    assert error.message_id == "broken-attribute"
+
+
+def test_terms_across_multiple_files():
+    """Test that terms defined in one file can be referenced in messages from another file."""
+    # Load terms file first, then messages file
+    bundle = fluent.Bundle("en", [data_dir / "terms_definitions.ftl", data_dir / "terms_messages.ftl"])
+
+    # Should have no validation errors
+    assert len(bundle.get_validation_errors()) == 0
+
+    # Verify messages correctly reference terms from the other file
+    assert bundle.get_translation("about-app") == "About SuperApp"
+    assert bundle.get_translation("app-title") == "SuperApp - The Best App"
+    assert bundle.get_translation("app-description") == "This is a Web App"
+    assert bundle.get_translation("company-info") == "Brought to you by Acme Corporation"
+
+
+def test_strict_mode_rejects_unknown_terms():
+    """Test that strict mode raises an error when unknown terms are referenced.
+
+    Note: When there are only validation errors (no parse errors), a ValueError
+    is raised. When there are parse errors, a ParserError is raised.
+    """
+    with pytest.raises(ValueError) as exc_info:
+        fluent.Bundle("en", [data_dir / "broken_terms.ftl"], strict=True)
+
+    error = exc_info.value
+
+    # Should have validation errors
+    assert hasattr(error, "validation_errors")
+    assert len(error.validation_errors) == 2
+
+    # Check that the errors mention the unknown term and attribute
+    error_messages = [e.message for e in error.validation_errors]
+    assert any("nonexistent-term" in msg for msg in error_messages)
+    assert any("nonexistent" in msg and "attribute" in msg.lower() for msg in error_messages)

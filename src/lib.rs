@@ -348,10 +348,37 @@ fn collect_vars_from_expression(expr: &fluent_syntax::ast::Expression<&str>, var
     }
 }
 
-/// Helper function to check all references in a resource against the bundle
+/// Helper struct to hold term information for validation
+#[derive(Debug, Clone)]
+struct TermInfo {
+    attributes: HashSet<String>,
+}
+
+/// Collect all term definitions from a resource
+fn collect_terms_from_resource(resource: &FluentResource) -> HashMap<String, TermInfo> {
+    use fluent_syntax::ast;
+    let mut terms = HashMap::new();
+
+    for entry in resource.entries() {
+        if let ast::Entry::Term(term) = entry {
+            let term_id = format!("-{}", term.id.name);
+            let attributes: HashSet<String> = term
+                .attributes
+                .iter()
+                .map(|attr| attr.id.name.to_string())
+                .collect();
+            terms.insert(term_id, TermInfo { attributes });
+        }
+    }
+
+    terms
+}
+
+/// Helper function to check all references in a resource against the bundle and available terms
 fn check_references(
     resource: &FluentResource,
     bundle: &FluentBundle<FluentResource>,
+    available_terms: &HashMap<String, TermInfo>,
 ) -> Vec<ValidationError> {
     use fluent_syntax::ast;
     let mut errors = Vec::new();
@@ -360,16 +387,16 @@ fn check_references(
         match entry {
             ast::Entry::Message(msg) => {
                 let msg_id = msg.id.name.to_string();
-                check_pattern_references(bundle, &msg.value, &msg_id, &mut errors);
+                check_pattern_references(bundle, &msg.value, &msg_id, available_terms, &mut errors);
                 for attr in &msg.attributes {
-                    check_pattern_references(bundle, &Some(attr.value.clone()), &msg_id, &mut errors);
+                    check_pattern_references(bundle, &Some(attr.value.clone()), &msg_id, available_terms, &mut errors);
                 }
             }
             ast::Entry::Term(term) => {
                 let term_id = format!("-{}", term.id.name);
-                check_pattern_references(bundle, &Some(term.value.clone()), &term_id, &mut errors);
+                check_pattern_references(bundle, &Some(term.value.clone()), &term_id, available_terms, &mut errors);
                 for attr in &term.attributes {
-                    check_pattern_references(bundle, &Some(attr.value.clone()), &term_id, &mut errors);
+                    check_pattern_references(bundle, &Some(attr.value.clone()), &term_id, available_terms, &mut errors);
                 }
             }
             _ => {}
@@ -383,6 +410,7 @@ fn check_pattern_references(
     bundle: &FluentBundle<FluentResource>,
     pattern: &Option<fluent_syntax::ast::Pattern<&str>>,
     current_msg_id: &str,
+    available_terms: &HashMap<String, TermInfo>,
     errors: &mut Vec<ValidationError>,
 ) {
     use fluent_syntax::ast;
@@ -390,7 +418,7 @@ fn check_pattern_references(
     if let Some(pattern) = pattern {
         for element in &pattern.elements {
             if let ast::PatternElement::Placeable { expression } = element {
-                check_expression_references(bundle, expression, current_msg_id, errors);
+                check_expression_references(bundle, expression, current_msg_id, available_terms, errors);
             }
         }
     }
@@ -400,6 +428,7 @@ fn check_expression_references(
     bundle: &FluentBundle<FluentResource>,
     expression: &fluent_syntax::ast::Expression<&str>,
     current_msg_id: &str,
+    available_terms: &HashMap<String, TermInfo>,
     errors: &mut Vec<ValidationError>,
 ) {
     use fluent_syntax::ast;
@@ -430,7 +459,8 @@ fn check_expression_references(
                 }
                 ast::InlineExpression::TermReference { id, attribute, .. } => {
                     let term_id = format!("-{}", id.name);
-                    if !bundle.has_message(&term_id) {
+                    // FIXED: Check against available_terms instead of bundle.has_message
+                    if !available_terms.contains_key(&term_id) {
                         errors.push(ValidationError {
                             error_type: "UnknownTerm".to_string(),
                             message: format!("Unknown term: -{}", id.name),
@@ -438,8 +468,9 @@ fn check_expression_references(
                             reference: Some(term_id),
                         });
                     } else if let Some(attr) = attribute {
-                        if let Some(term) = bundle.get_message(&term_id) {
-                            if term.get_attribute(attr.name).is_none() {
+                        // FIXED: Check term attributes from available_terms instead of bundle.get_message
+                        if let Some(term_info) = available_terms.get(&term_id) {
+                            if !term_info.attributes.contains(attr.name) {
                                 errors.push(ValidationError {
                                     error_type: "UnknownAttribute".to_string(),
                                     message: format!("Unknown attribute on term: -{}.{}", id.name, attr.name),
@@ -454,9 +485,9 @@ fn check_expression_references(
             }
         }
         ast::Expression::Select { selector, variants } => {
-            check_expression_references(bundle, &ast::Expression::Inline((*selector).clone()), current_msg_id, errors);
+            check_expression_references(bundle, &ast::Expression::Inline((*selector).clone()), current_msg_id, available_terms, errors);
             for variant in variants {
-                check_pattern_references(bundle, &Some(variant.value.clone()), current_msg_id, errors);
+                check_pattern_references(bundle, &Some(variant.value.clone()), current_msg_id, available_terms, errors);
             }
         }
     }
@@ -627,6 +658,8 @@ mod rustfluent {
             // Separate error collections by type
             let mut all_parse_errors = Vec::new();
             let mut all_validation_errors = Vec::new();
+            // Track all terms across all resources for validation
+            let mut all_terms: HashMap<String, TermInfo> = HashMap::new();
 
             for file_path in ftl_filenames.iter() {
                 let contents = fs::read_to_string(file_path)
@@ -674,7 +707,12 @@ mod rustfluent {
                         id.to_string()
                     };
 
-                    let exists_in_bundle = bundle.has_message(&full_id);
+                    // FIXED: For terms, check our term index instead of bundle.has_message
+                    let exists_in_bundle = if kind == "term" {
+                        all_terms.contains_key(&full_id)
+                    } else {
+                        bundle.has_message(&full_id)
+                    };
                     let exists_in_file = !seen_in_file.insert(full_id.clone());
 
                     if exists_in_bundle || exists_in_file {
@@ -690,10 +728,17 @@ mod rustfluent {
                     }
                 }
 
+                // Collect terms from this resource
+                let current_resource_terms = collect_terms_from_resource(&resource);
+
                 // Check references and cycles BEFORE adding if validation is enabled
                 if validate_references {
-                    // Check if references in this resource exist in current bundle
-                    let ref_errors = check_references(&resource, &bundle);
+                    // Merge current resource terms with all previously seen terms for validation
+                    let mut available_terms = all_terms.clone();
+                    available_terms.extend(current_resource_terms.clone());
+
+                    // Check if references in this resource exist in current bundle or available terms
+                    let ref_errors = check_references(&resource, &bundle, &available_terms);
                     // CHANGED: Don't raise immediately, collect all errors
                     all_validation_errors.extend(ref_errors);
 
@@ -702,6 +747,9 @@ mod rustfluent {
                     // CHANGED: Don't raise immediately, collect all errors
                     all_validation_errors.extend(cycle_errors);
                 }
+
+                // Add terms from this resource to the cumulative term index
+                all_terms.extend(current_resource_terms);
 
                 // Add the resource (will override duplicates)
                 bundle.add_resource_overriding(resource);
