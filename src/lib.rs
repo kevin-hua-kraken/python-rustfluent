@@ -457,8 +457,25 @@ fn check_expression_references(
                         }
                     }
                 }
-                ast::InlineExpression::TermReference { id, attribute, .. } => {
+                ast::InlineExpression::TermReference { id, attribute, arguments } => {
                     let term_id = format!("-{}", id.name);
+
+                    // Validate that terms don't receive positional arguments
+                    // Per Fluent spec, positional arguments to terms are ignored, so we warn about them
+                    if let Some(args) = arguments {
+                        if !args.positional.is_empty() {
+                            errors.push(ValidationError {
+                                error_type: "IgnoredPositionalArgument".to_string(),
+                                message: format!(
+                                    "Positional arguments passed to term -{} are ignored. Use named arguments instead.",
+                                    id.name
+                                ),
+                                message_id: Some(current_msg_id.to_string()),
+                                reference: Some(term_id.clone()),
+                            });
+                        }
+                    }
+
                     // FIXED: Check against available_terms instead of bundle.has_message
                     if !available_terms.contains_key(&term_id) {
                         errors.push(ValidationError {

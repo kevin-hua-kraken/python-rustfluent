@@ -434,3 +434,57 @@ def test_strict_mode_rejects_unknown_terms():
     error_messages = [e.message for e in error.validation_errors]
     assert any("nonexistent-term" in msg for msg in error_messages)
     assert any("nonexistent" in msg and "attribute" in msg.lower() for msg in error_messages)
+
+
+def test_term_positional_arguments_generate_validation_error():
+    """Test that positional arguments to terms generate a validation error.
+
+    Per Fluent spec, positional arguments to terms are syntactically valid but
+    semantically ignored at runtime. We warn about them to prevent confusion.
+    """
+    bundle = fluent.Bundle("en", [data_dir / "term_positional_args.ftl"])
+
+    # Should have validation errors for the two messages with positional args
+    validation_errors = bundle.get_validation_errors()
+    assert len(validation_errors) == 2
+
+    # Both errors should be about ignored positional arguments
+    for error in validation_errors:
+        assert error.error_type == "IgnoredPositionalArgument"
+        assert "positional" in error.message.lower() or "ignored" in error.message.lower()
+        assert "-brand-name" in error.message
+        assert error.message_id in ["bad-reference", "bad-reference-mixed"]
+
+    # The good reference should still work correctly
+    assert bundle.get_translation("good-reference") == "About Firefoxie."
+
+
+def test_strict_mode_rejects_term_positional_arguments():
+    """Test that strict mode raises an error when terms are given positional arguments."""
+    with pytest.raises(ValueError) as exc_info:
+        fluent.Bundle("en", [data_dir / "term_positional_args.ftl"], strict=True)
+
+    error = exc_info.value
+
+    # Should have validation errors
+    assert hasattr(error, "validation_errors")
+    assert len(error.validation_errors) == 2
+
+    # Check that the errors mention positional arguments
+    error_messages = [e.message for e in error.validation_errors]
+    assert all("positional" in msg.lower() or "ignored" in msg.lower() for msg in error_messages)
+
+
+def test_term_positional_arguments_validation_has_correct_context():
+    """Test that positional argument validation errors have correct context."""
+    bundle = fluent.Bundle("en", [data_dir / "term_positional_args.ftl"])
+
+    validation_errors = bundle.get_validation_errors()
+
+    # Find the error for bad-reference
+    bad_ref_error = next(e for e in validation_errors if e.message_id == "bad-reference")
+
+    assert bad_ref_error.error_type == "IgnoredPositionalArgument"
+    assert bad_ref_error.message_id == "bad-reference"
+    assert bad_ref_error.reference == "-brand-name"
+    assert "named arguments" in bad_ref_error.message
